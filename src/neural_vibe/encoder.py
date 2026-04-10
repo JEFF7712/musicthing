@@ -3,12 +3,94 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
 log = logging.getLogger(__name__)
+
+# WhisperX model to use for transcription. "large-v3" is most accurate
+# but needs ~6GB VRAM; "small" needs ~500MB and is much faster on limited GPUs.
+WHISPER_MODEL = os.environ.get("NEURAL_VIBE_WHISPER_MODEL", "small")
+
+
+def _patch_whisperx_model():
+    """Monkey-patch TRIBE v2's WhisperX invocation to use a smaller/faster model
+    and allow GPU transcription on low-VRAM cards."""
+    import tribev2.eventstransforms as et
+
+    original = et.ExtractWordsFromAudio._get_transcript_from_audio
+
+    @staticmethod
+    def _patched_transcribe(wav_filename, language):
+        import json
+        import subprocess
+        import tempfile
+
+        language_codes = dict(
+            english="en", french="fr", spanish="es", dutch="nl", chinese="zh"
+        )
+        if language not in language_codes:
+            raise ValueError(f"Language {language} not supported")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+
+        log.info(
+            "WhisperX: model=%s, device=%s, compute=%s",
+            WHISPER_MODEL, device, compute_type,
+        )
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            cmd = [
+                "uvx", "whisperx",
+                str(wav_filename),
+                "--model", WHISPER_MODEL,
+                "--language", language_codes[language],
+                "--device", device,
+                "--compute_type", compute_type,
+                "--batch_size", "16",
+                "--output_dir", output_dir,
+                "--output_format", "json",
+            ]
+            # Add alignment model for English
+            if language == "english":
+                cmd.extend(["--align_model", "WAV2VEC2_ASR_LARGE_LV60K_960H"])
+
+            env = {k: v for k, v in os.environ.items() if k != "MPLBACKEND"}
+            # Ensure CUDA is visible to the subprocess
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                raise RuntimeError(f"whisperx failed:\n{result.stderr}")
+
+            json_path = Path(output_dir) / f"{wav_filename.stem}.json"
+            transcript = json.loads(json_path.read_text())
+
+        # Reconstruct word list exactly as TRIBE v2 expects
+        import pandas as pd
+
+        words = []
+        for i, segment in enumerate(transcript["segments"]):
+            sentence = segment["text"].replace('"', "")
+            for word in segment.get("words", []):
+                if "start" not in word:
+                    continue
+                words.append({
+                    "text": word["word"].replace('"', ""),
+                    "start": word["start"],
+                    "duration": word["end"] - word["start"],
+                    "sequence_id": i,
+                    "sentence": sentence,
+                })
+
+        return pd.DataFrame(words) if words else pd.DataFrame(
+            columns=["text", "start", "duration", "sequence_id", "sentence"]
+        )
+
+    et.ExtractWordsFromAudio._get_transcript_from_audio = _patched_transcribe
 
 
 class NeuralEncoder:
@@ -27,16 +109,11 @@ class NeuralEncoder:
     @staticmethod
     def _pick_device() -> str:
         if torch.cuda.is_available():
-            vram_mb = torch.cuda.get_device_properties(0).total_mem / 1024**2
-            # Wav2VecBert (~600MB) + FmriEncoder (~200MB) fit in 4GB
-            # but Llama 3.2 3B (~6GB fp16) does not.
-            # We'll load the model on CPU and let TRIBE v2 handle device
-            # placement, or force CPU if VRAM is tight.
+            vram_mb = torch.cuda.get_device_properties(0).total_memory / 1024**2
             if vram_mb < 6000:
                 log.info(
-                    "Only %.0f MB VRAM available — using CPU to avoid OOM "
-                    "(Llama 3.2 3B needs ~6GB). Indexing will be slower but safe.",
-                    vram_mb,
+                    "%.0f MB VRAM — TRIBE v2 on CPU, WhisperX '%s' on GPU.",
+                    vram_mb, WHISPER_MODEL,
                 )
                 return "cpu"
             return "cuda"
@@ -47,6 +124,9 @@ class NeuralEncoder:
         if self._model is not None:
             return
 
+        # Patch WhisperX before any TRIBE v2 imports trigger it
+        _patch_whisperx_model()
+
         from tribev2 import TribeModel
 
         log.info("Loading TRIBE v2 model (device=%s)…", self._device)
@@ -54,7 +134,6 @@ class NeuralEncoder:
             "facebook/tribev2",
             cache_folder=self._cache_dir,
         )
-        # Move to chosen device if the model exposes a .to() method
         if hasattr(self._model, "to"):
             self._model.to(self._device)
         log.info("TRIBE v2 model loaded.")
@@ -75,7 +154,6 @@ class NeuralEncoder:
         log.info("Predicting brain response…")
         preds, _segments = self._model.predict(events=df)
 
-        # preds shape: (n_timesteps, n_vertices) — typically (~T, ~20k)
         if isinstance(preds, torch.Tensor):
             preds = preds.detach().cpu().numpy()
 

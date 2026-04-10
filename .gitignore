@@ -8,3 +8,6 @@ data/
 .cache/
 *.faiss
 result
+.direnv/
+.envrc
+Music/

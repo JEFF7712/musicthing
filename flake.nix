@@ -26,6 +26,10 @@
             ffmpeg
             sox
 
+            # Shared libs needed by pip-installed wheels (numpy, etc.)
+            zlib
+            libGL
+
             # Build tools (for native extensions)
             gcc
             stdenv.cc.cc.lib
@@ -36,7 +40,7 @@
           ];
 
           shellHook = ''
-            export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.cudaPackages.cudatoolkit}/lib:${pkgs.cudaPackages.cudnn}/lib:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="${pkgs.zlib}/lib:${pkgs.libGL}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.cudaPackages.cudatoolkit}/lib:${pkgs.cudaPackages.cudnn}/lib:/run/opengl-driver/lib:$LD_LIBRARY_PATH"
             export CUDA_PATH="${pkgs.cudaPackages.cudatoolkit}"
 
             # Create venv if it doesn't exist
