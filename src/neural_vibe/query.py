@@ -63,6 +63,9 @@ def query_similar(
 
     target = np.mean(fingerprints, axis=0).astype(np.float32).reshape(1, -1)
 
+    # Normalize for cosine similarity (matches how the index was built)
+    faiss.normalize_L2(target)
+
     # Search — request extra results to filter out seed songs
     k = min(n + len(seed_paths), index.ntotal)
     distances, indices = index.search(target, k)

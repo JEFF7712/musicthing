@@ -22,38 +22,29 @@ from neuralset.events.study import Study
 
 log = logging.getLogger(__name__)
 
-_SUBJECTS = ["sub-01", "sub-02", "sub-03", "sub-04", "sub-05"]
+_SUBJECTS = ["sub-001", "sub-002", "sub-003", "sub-004", "sub-005"]
 
-# 12 training runs + 6 test runs per subject
+# Two BIDS tasks: Training (12 runs) and Test (6 runs)
+_TRAIN_TASK = "Training"
+_TEST_TASK = "Test"
 _TRAIN_RUNS = [f"run-{i:02d}" for i in range(1, 13)]
-_TEST_RUNS = [f"run-{i:02d}" for i in range(13, 19)]
+_TEST_RUNS = [f"run-{i:02d}" for i in range(1, 7)]
 
 
-def _get_audio_path(bids_root: Path, subject: str, run: str) -> Path:
-    """Get the stimulus audio file for a given run.
-
-    Audio stimuli are stored as extracted clips in a stimuli/ directory,
-    one per run (concatenated from the 10 x 15s clips in that run).
-    """
-    return bids_root / "stimuli" / f"{subject}_{run}_audio.wav"
-
-
-def _get_events_tsv(bids_root: Path, subject: str, run: str) -> Path:
+def _get_events_tsv(bids_root: Path, subject: str, task: str, run: str) -> Path:
     """Get the BIDS events.tsv file for a run."""
     return (
-        bids_root / subject / "func" / f"{subject}_task-music_{run}_events.tsv"
+        bids_root / subject / "func" / f"{subject}_task-{task}_{run}_events.tsv"
     )
 
 
-def _get_fmri_path(
-    derivatives_root: Path, subject: str, run: str
-) -> Path:
+def _get_fmri_path(derivatives_root: Path, subject: str, task: str, run: str) -> Path:
     """Get the preprocessed (fMRIPrep) BOLD file for a run."""
     return (
         derivatives_root
         / subject
         / "func"
-        / f"{subject}_task-music_{run}_space-MNI152NLin2009cAsym_desc-preproc_bold.nii.gz"
+        / f"{subject}_task-{task}_{run}_space-MNI152NLin2009cAsym_desc-preproc_bold.nii.gz"
     )
 
 
@@ -63,12 +54,11 @@ class Nakai2021Bold(Study):
     Expects data laid out as:
         {path}/
         ├── raw/           # BIDS raw data (from OpenNeuro ds003720)
-        │   ├── sub-01/
+        │   ├── sub-001/
         │   ├── ...
-        │   ├── sub-05/
-        │   └── stimuli/   # extracted audio per run
+        │   └── sub-005/
         └── derivatives/   # fMRIPrep output
-            ├── sub-01/
+            ├── sub-001/
             └── ...
     """
 
@@ -103,11 +93,12 @@ class Nakai2021Bold(Study):
             )
 
     def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
-        """Yield one timeline per (subject, run) combination."""
+        """Yield one timeline per (subject, task, run) combination."""
         for subject in _SUBJECTS:
-            all_runs = _TRAIN_RUNS + _TEST_RUNS
-            for run in all_runs:
-                yield dict(subject=subject, run=run)
+            for run in _TRAIN_RUNS:
+                yield dict(subject=subject, task=_TRAIN_TASK, run=run)
+            for run in _TEST_RUNS:
+                yield dict(subject=subject, task=_TEST_TASK, run=run)
 
     def _load_timeline_events(
         self, timeline: dict[str, tp.Any]
@@ -121,12 +112,13 @@ class Nakai2021Bold(Study):
         import nibabel
 
         subject = timeline["subject"]
+        task = timeline["task"]
         run = timeline["run"]
         raw_dir = self.path / "raw"
         deriv_dir = self.path / "derivatives"
 
         # --- fMRI data ---
-        fmri_path = _get_fmri_path(deriv_dir, subject, run)
+        fmri_path = _get_fmri_path(deriv_dir, subject, task, run)
         if not fmri_path.exists():
             raise FileNotFoundError(
                 f"Preprocessed fMRI not found: {fmri_path}\n"
@@ -151,53 +143,27 @@ class Nakai2021Bold(Study):
             )
         )
 
-        # --- Audio stimulus events ---
-        events_tsv = _get_events_tsv(raw_dir, subject, run)
+        # --- Music clip events from events.tsv ---
+        events_tsv = _get_events_tsv(raw_dir, subject, task, run)
         if events_tsv.exists():
             events_df = pd.read_csv(events_tsv, sep="\t")
+            # Columns: onset, duration, genre, track, start, end
             for _, row in events_df.iterrows():
                 onset = float(row["onset"])
                 dur = float(row.get("duration", self.CLIP_DURATION_S))
-
-                # The audio file for this specific clip
-                # BIDS stim_file column points to the stimulus
-                stim_file = row.get("stim_file", "")
-                if stim_file and (raw_dir / stim_file).exists():
-                    audio_path = str(raw_dir / stim_file)
-                else:
-                    # Fall back to per-run concatenated audio
-                    audio_path = str(_get_audio_path(raw_dir, subject, run))
+                genre = str(row.get("genre", "")).strip("'\"")
 
                 audio_event = dict(
                     type="Audio",
                     start=onset,
                     duration=dur,
                     stop=onset + dur,
-                    filepath=audio_path,
+                    genre=genre,
+                    track=int(row["track"]) if "track" in row else -1,
                 )
                 all_events.append(audio_event)
 
-                # If genre info is available, add as metadata
-                genre = row.get("genre", row.get("trial_type", None))
-                if genre is not None:
-                    all_events[-1]["genre"] = str(genre)
-        else:
-            # No events.tsv — treat the full run audio as one event
-            audio_path = _get_audio_path(raw_dir, subject, run)
-            if audio_path.exists():
-                all_events.append(
-                    dict(
-                        type="Audio",
-                        start=0,
-                        duration=duration,
-                        filepath=str(audio_path),
-                    )
-                )
-
         result = pd.DataFrame(all_events)
-
-        # Mark split: runs 13-18 are test
-        is_test = run in _TEST_RUNS
-        result["split"] = "test" if is_test else "train"
+        result["split"] = "test" if task == _TEST_TASK else "train"
 
         return result

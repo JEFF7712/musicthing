@@ -11,3 +11,5 @@ result
 .direnv/
 .envrc
 Music/
+.freesurfer/
+.claude

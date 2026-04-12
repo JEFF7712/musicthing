@@ -107,7 +107,7 @@ def query(seeds: tuple[str, ...], num: int, data_dir: str, cache_dir: str) -> No
     table.add_column("#", style="dim", width=3)
     table.add_column("Title", style="bold")
     table.add_column("Artist")
-    table.add_column("Distance", justify="right")
+    table.add_column("Similarity", justify="right")
     table.add_column("Path", style="dim")
 
     for m in matches:
@@ -174,13 +174,27 @@ def download(data_dir: str) -> None:
 @click.argument("data_dir", default="data/nakai2021", type=click.Path(exists=True))
 @click.option("--n-cpus", default=4, show_default=True, help="CPUs for fMRIPrep.")
 @click.option("--fs-license", type=click.Path(exists=True), help="FreeSurfer license file.")
-def preprocess(data_dir: str, n_cpus: int, fs_license: str | None) -> None:
-    """Run fMRIPrep on the raw Nakai 2021 BIDS data."""
+@click.option(
+    "--runner",
+    type=click.Choice(["docker", "apptainer", "native"]),
+    default="docker",
+    show_default=True,
+    help="How to run fMRIPrep (docker/apptainer recommended).",
+)
+def preprocess(
+    data_dir: str, n_cpus: int, fs_license: str | None, runner: str
+) -> None:
+    """Run fMRIPrep on the raw Nakai 2021 BIDS data.
+
+    fMRIPrep requires FreeSurfer, FSL, ANTs, etc. The easiest way to
+    run it is via Docker or Apptainer (Singularity), which bundle all
+    dependencies.
+    """
     import subprocess
     from pathlib import Path
 
-    raw_dir = Path(data_dir) / "raw"
-    deriv_dir = Path(data_dir) / "derivatives"
+    raw_dir = Path(data_dir).resolve() / "raw"
+    deriv_dir = Path(data_dir).resolve() / "derivatives"
     deriv_dir.mkdir(parents=True, exist_ok=True)
 
     if not raw_dir.exists():
@@ -188,22 +202,44 @@ def preprocess(data_dir: str, n_cpus: int, fs_license: str | None) -> None:
         console.print("Run 'neural-vibe download' first.")
         sys.exit(1)
 
-    cmd = [
-        "fmriprep",
+    # fMRIPrep arguments (common to all runners)
+    fmriprep_args = [
         str(raw_dir),
         str(deriv_dir),
         "participant",
         "--nprocs", str(n_cpus),
         "--output-spaces", "MNI152NLin2009cAsym",
-        "--bold2t1w-dof", "6",
+        "--bold2anat-dof", "6",
     ]
     if fs_license:
-        cmd.extend(["--fs-license-file", fs_license])
+        fmriprep_args.extend(["--fs-license-file", str(Path(fs_license).resolve())])
     else:
-        # Skip FreeSurfer surface reconstruction (faster)
-        cmd.append("--fs-no-reconall")
+        fmriprep_args.append("--fs-no-reconall")
 
-    console.print(f"Running fMRIPrep with {n_cpus} CPUs…")
+    if runner == "docker":
+        cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{raw_dir}:{raw_dir}:ro",
+            "-v", f"{deriv_dir}:{deriv_dir}",
+        ]
+        if fs_license:
+            lic = Path(fs_license).resolve()
+            cmd.extend(["-v", f"{lic}:{lic}:ro"])
+        cmd.extend(["nipreps/fmriprep:latest", *fmriprep_args])
+    elif runner == "apptainer":
+        cmd = [
+            "apptainer", "run", "--cleanenv",
+            "-B", f"{raw_dir}:{raw_dir}:ro",
+            "-B", f"{deriv_dir}:{deriv_dir}",
+        ]
+        if fs_license:
+            lic = Path(fs_license).resolve()
+            cmd.extend(["-B", f"{lic}:{lic}:ro"])
+        cmd.extend(["docker://nipreps/fmriprep:latest", *fmriprep_args])
+    else:
+        cmd = ["fmriprep", *fmriprep_args]
+
+    console.print(f"Running fMRIPrep via [bold]{runner}[/bold] with {n_cpus} CPUs…")
     console.print(f"  [dim]{' '.join(cmd)}[/dim]\n")
 
     result = subprocess.run(cmd)
@@ -269,11 +305,20 @@ def finetune(
     help="Output archive path. Defaults to <data_dir>-upload.tar.gz",
 )
 @click.option(
-    "--include-raw",
-    is_flag=True,
-    help="Include raw BIDS data (needed if cloud hasn't downloaded it).",
+    "--subjects",
+    default=None,
+    help="Comma-separated subjects to include (e.g. 'sub-001,sub-002'). Default: all.",
 )
-def package(data_dir: str, output: str | None, include_raw: bool) -> None:
+@click.option(
+    "--bold-only",
+    is_flag=True,
+    default=True,
+    show_default=True,
+    help="Only include preprocessed BOLD + events (skip masks/confounds/transforms).",
+)
+def package(
+    data_dir: str, output: str | None, subjects: str | None, bold_only: bool
+) -> None:
     """Package preprocessed data for upload to a cloud GPU instance."""
     import tarfile
     from pathlib import Path
@@ -286,45 +331,56 @@ def package(data_dir: str, output: str | None, include_raw: bool) -> None:
         console.print("[red]No derivatives/ found — run preprocessing first.[/red]")
         sys.exit(1)
 
+    # Filter subjects
+    if subjects:
+        subject_list = [s.strip() for s in subjects.split(",")]
+    else:
+        subject_list = sorted(
+            d.name for d in deriv_dir.iterdir()
+            if d.is_dir() and d.name.startswith("sub-")
+        )
+
     if output is None:
         output = f"{data_path.name}-upload.tar.gz"
 
-    console.print(f"Packaging [bold]{data_dir}[/bold] for cloud upload…\n")
-
-    # Collect what to include
-    include_dirs = [("derivatives", deriv_dir)]
-
-    # Always include stimuli (audio files needed for fine-tuning)
-    stimuli_dir = raw_dir / "stimuli"
-    if stimuli_dir.exists():
-        include_dirs.append(("raw/stimuli", stimuli_dir))
-
-    # Include events.tsv files (small, needed for timeline loading)
-    events_files = list(raw_dir.rglob("*_events.tsv")) if raw_dir.exists() else []
-
-    if include_raw:
-        include_dirs = [("raw", raw_dir), ("derivatives", deriv_dir)]
-        events_files = []  # already included via raw/
+    console.print(f"Packaging [bold]{len(subject_list)}[/bold] subject(s) for cloud upload…")
+    console.print(f"  Subjects: {', '.join(subject_list)}\n")
 
     total_size = 0
     with tarfile.open(output, "w:gz") as tar:
-        for arcname_prefix, dir_path in include_dirs:
-            for f in sorted(dir_path.rglob("*")):
+        # Add preprocessed BOLD files per subject
+        for subj in subject_list:
+            subj_deriv = deriv_dir / subj / "func"
+            if not subj_deriv.exists():
+                console.print(f"  [yellow]Skipping {subj} — no derivatives[/yellow]")
+                continue
+
+            for f in sorted(subj_deriv.iterdir()):
                 if not f.is_file():
                     continue
-                arcname = f"{data_path.name}/{arcname_prefix}/{f.relative_to(dir_path)}"
+                # If bold-only, skip everything except preproc BOLD and its JSON
+                if bold_only and "preproc_bold" not in f.name:
+                    continue
+                arcname = f"{data_path.name}/derivatives/{subj}/func/{f.name}"
                 tar.add(str(f), arcname=arcname)
                 total_size += f.stat().st_size
+                console.print(f"  [dim]{f.name} ({f.stat().st_size / 1024**2:.0f} MB)[/dim]")
 
-        # Add individual events.tsv files
-        for events_f in events_files:
-            rel = events_f.relative_to(raw_dir)
-            arcname = f"{data_path.name}/raw/{rel}"
-            tar.add(str(events_f), arcname=arcname)
-            total_size += events_f.stat().st_size
+            # Add events.tsv from raw
+            subj_raw = raw_dir / subj / "func"
+            if subj_raw.exists():
+                for ef in sorted(subj_raw.glob("*_events.tsv")):
+                    arcname = f"{data_path.name}/raw/{subj}/func/{ef.name}"
+                    tar.add(str(ef), arcname=arcname)
+                    total_size += ef.stat().st_size
+
+        # Add dataset_description.json if present
+        desc = deriv_dir / "dataset_description.json"
+        if desc.exists():
+            tar.add(str(desc), arcname=f"{data_path.name}/derivatives/dataset_description.json")
 
     archive_size = Path(output).stat().st_size
-    console.print(f"  Source data:  {total_size / 1024**3:.1f} GB")
+    console.print(f"\n  Source data:  {total_size / 1024**3:.1f} GB")
     console.print(f"  Archive size: {archive_size / 1024**3:.1f} GB")
     console.print(f"\n[green]Saved to {output}[/green]")
     console.print(

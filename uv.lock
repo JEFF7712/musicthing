@@ -1568,6 +1568,7 @@ dependencies = [
     { name = "mutagen" },
     { name = "numpy" },
     { name = "rich" },
+    { name = "scipy" },
     { name = "tribev2" },
 ]
 
@@ -1594,6 +1595,7 @@ requires-dist = [
     { name = "openneuro-py", marker = "extra == 'finetune'", specifier = ">=2024.1" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "rich", specifier = ">=13.0" },
+    { name = "scipy", specifier = ">=1.12" },
     { name = "tribev2", git = "https://github.com/facebookresearch/tribev2.git" },
 ]
 provides-extras = ["finetune", "dev"]

@@ -6,6 +6,13 @@ import logging
 import os
 from pathlib import Path
 
+# Force CPU mode before torch is imported anywhere.
+# PyTorch 2.6 (CUDA 12.4 runtime) is incompatible with CUDA 13.2 driver
+# on this system, causing "CUDA unknown error". Hiding the GPU prevents
+# TRIBE v2 internals from attempting .to("cuda") and crashing.
+if not os.environ.get("NEURAL_VIBE_ALLOW_CUDA"):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import numpy as np
 import torch
 
@@ -35,8 +42,8 @@ def _patch_whisperx_model():
         if language not in language_codes:
             raise ValueError(f"Language {language} not supported")
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+        device = "cpu"
+        compute_type = "int8"
 
         log.info(
             "WhisperX: model=%s, device=%s, compute=%s",
@@ -109,14 +116,8 @@ class NeuralEncoder:
     @staticmethod
     def _pick_device() -> str:
         if torch.cuda.is_available():
-            vram_mb = torch.cuda.get_device_properties(0).total_memory / 1024**2
-            if vram_mb < 6000:
-                log.info(
-                    "%.0f MB VRAM — TRIBE v2 on CPU, WhisperX '%s' on GPU.",
-                    vram_mb, WHISPER_MODEL,
-                )
-                return "cpu"
             return "cuda"
+        log.info("Running on CPU (Whisper model: %s).", WHISPER_MODEL)
         return "cpu"
 
     def load(self) -> None:
@@ -130,12 +131,19 @@ class NeuralEncoder:
         from tribev2 import TribeModel
 
         log.info("Loading TRIBE v2 model (device=%s)…", self._device)
+        # Override device for all extractors — the shipped config hardcodes "cuda"
+        # Also disable text features: Llama 3.2 3B is too slow on CPU (~hours
+        # per song). Audio features (Wav2VecBert) capture the sound itself,
+        # which is what matters for music "vibe" matching.
+        config_update = {
+            "data.audio_feature.device": self._device,
+            "data.features_to_use": ["audio"],
+        }
         self._model = TribeModel.from_pretrained(
             "facebook/tribev2",
             cache_folder=self._cache_dir,
+            config_update=config_update,
         )
-        if hasattr(self._model, "to"):
-            self._model.to(self._device)
         log.info("TRIBE v2 model loaded.")
 
     def predict_brain_response(self, audio_path: str | Path) -> np.ndarray:
@@ -162,21 +170,47 @@ class NeuralEncoder:
     def encode(self, audio_path: str | Path) -> np.ndarray:
         """Encode a song into a neural fingerprint vector.
 
-        The fingerprint concatenates the mean and standard deviation of
-        predicted cortical activation across time, giving a fixed-size
-        vector regardless of song length.
+        Uses PCA to reduce the ~20k cortical vertices to principal
+        components, then computes distributional statistics over time
+        for each component. This captures how the song's brain response
+        *evolves* — not just its average.
 
         Returns:
-            1-D float32 array of shape (2 * n_vertices,).
+            1-D float32 array.
         """
+        from scipy.stats import skew as _skew
+
         preds = self.predict_brain_response(audio_path)
-        mean = preds.mean(axis=0)
-        std = preds.std(axis=0)
-        fingerprint = np.concatenate([mean, std]).astype(np.float32)
+        # preds shape: (T, ~20k vertices)
+
+        # PCA: reduce vertices to top N_COMPONENTS principal components
+        N_COMPONENTS = 50
+        # Center the data
+        mean_vec = preds.mean(axis=0)
+        centered = preds - mean_vec
+        # SVD on (T, V) — since T < V, this is efficient
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        # Project onto top components: (T, N_COMPONENTS)
+        n = min(N_COMPONENTS, U.shape[1])
+        projected = U[:, :n] * S[:n]  # (T, n)
+
+        # Compute distributional stats per component
+        parts = [
+            projected.mean(axis=0),                         # mean (n,)
+            projected.std(axis=0),                          # std (n,)
+            _skew(projected, axis=0),                       # skewness (n,)
+            np.percentile(projected, 10, axis=0),           # 10th pctile (n,)
+            np.percentile(projected, 50, axis=0),           # median (n,)
+            np.percentile(projected, 90, axis=0),           # 90th pctile (n,)
+            np.diff(projected, axis=0).std(axis=0),         # volatility (n,)
+            S[:n] / S[:n].sum(),                            # explained variance ratio (n,)
+        ]
+        fingerprint = np.concatenate(parts).astype(np.float32)
+
         log.info(
-            "Fingerprint for %s: dim=%d, norm=%.2f",
+            "Fingerprint for %s: dim=%d (PCA %d components × 8 stats)",
             Path(audio_path).name,
             fingerprint.shape[0],
-            np.linalg.norm(fingerprint),
+            n,
         )
         return fingerprint

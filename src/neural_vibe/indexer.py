@@ -150,9 +150,12 @@ def build_index(
     new_matrix = np.stack(new_fingerprints)
     dim = new_matrix.shape[1]
 
-    # Create or extend FAISS index
+    # Normalize for cosine similarity
+    faiss.normalize_L2(new_matrix)
+
+    # Create or extend FAISS index (inner product on L2-normalized vectors = cosine sim)
     if index is None:
-        index = faiss.IndexFlatL2(dim)
+        index = faiss.IndexFlatIP(dim)
         metadata = []
 
     index.add(new_matrix)
