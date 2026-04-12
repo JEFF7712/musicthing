@@ -108,10 +108,17 @@ class NeuralEncoder:
     activations over time.
     """
 
-    def __init__(self, cache_dir: str = ".cache/tribev2", device: str | None = None):
+    def __init__(
+        self,
+        cache_dir: str = ".cache/tribev2",
+        device: str | None = None,
+        region_weights: dict[str, float] | None = None,
+    ):
         self._cache_dir = cache_dir
         self._device = device or self._pick_device()
         self._model = None
+        self._region_weights = region_weights
+        self._weight_vector = None
 
     @staticmethod
     def _pick_device() -> str:
@@ -167,50 +174,64 @@ class NeuralEncoder:
 
         return preds
 
+    @staticmethod
+    def _pca_stats(data: np.ndarray, n_components: int = 15) -> np.ndarray:
+        """PCA + distributional stats on a (T, V) activation matrix."""
+        from scipy.stats import skew as _skew
+
+        mean_vec = data.mean(axis=0)
+        centered = data - mean_vec
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        n = min(n_components, U.shape[1])
+        projected = U[:, :n] * S[:n]
+
+        parts = [
+            projected.mean(axis=0),
+            projected.std(axis=0),
+            _skew(projected, axis=0),
+            np.percentile(projected, 10, axis=0),
+            np.percentile(projected, 50, axis=0),
+            np.percentile(projected, 90, axis=0),
+            np.diff(projected, axis=0).std(axis=0),
+            S[:n] / S[:n].sum(),
+        ]
+        return np.concatenate(parts)
+
     def encode(self, audio_path: str | Path) -> np.ndarray:
         """Encode a song into a neural fingerprint vector.
 
-        Uses PCA to reduce the ~20k cortical vertices to principal
-        components, then computes distributional statistics over time
-        for each component. This captures how the song's brain response
-        *evolves* — not just its average.
+        Computes separate PCA fingerprints for each brain region group
+        (auditory, limbic, prefrontal) plus the full cortex. This allows
+        region-weighted similarity at query time without re-indexing.
+
+        The fingerprint layout is:
+          [auditory_stats | limbic_stats | prefrontal_stats | global_stats]
 
         Returns:
             1-D float32 array.
         """
-        from scipy.stats import skew as _skew
+        from .regions import REGION_GROUPS, load_vertex_labels
 
         preds = self.predict_brain_response(audio_path)
         # preds shape: (T, ~20k vertices)
 
-        # PCA: reduce vertices to top N_COMPONENTS principal components
-        N_COMPONENTS = 50
-        # Center the data
-        mean_vec = preds.mean(axis=0)
-        centered = preds - mean_vec
-        # SVD on (T, V) — since T < V, this is efficient
-        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-        # Project onto top components: (T, N_COMPONENTS)
-        n = min(N_COMPONENTS, U.shape[1])
-        projected = U[:, :n] * S[:n]  # (T, n)
+        labels = load_vertex_labels()
 
-        # Compute distributional stats per component
-        parts = [
-            projected.mean(axis=0),                         # mean (n,)
-            projected.std(axis=0),                          # std (n,)
-            _skew(projected, axis=0),                       # skewness (n,)
-            np.percentile(projected, 10, axis=0),           # 10th pctile (n,)
-            np.percentile(projected, 50, axis=0),           # median (n,)
-            np.percentile(projected, 90, axis=0),           # 90th pctile (n,)
-            np.diff(projected, axis=0).std(axis=0),         # volatility (n,)
-            S[:n] / S[:n].sum(),                            # explained variance ratio (n,)
-        ]
-        fingerprint = np.concatenate(parts).astype(np.float32)
+        # Per-region PCA fingerprints (15 components × 8 stats = 120 dims each)
+        region_parts = []
+        for group_name in ["auditory", "limbic", "prefrontal"]:
+            mask = np.isin(labels, REGION_GROUPS[group_name])
+            region_data = preds[:, mask]
+            region_parts.append(self._pca_stats(region_data, n_components=15))
+
+        # Global PCA (20 components × 8 stats = 160 dims)
+        global_part = self._pca_stats(preds, n_components=20)
+
+        fingerprint = np.concatenate(region_parts + [global_part]).astype(np.float32)
 
         log.info(
-            "Fingerprint for %s: dim=%d (PCA %d components × 8 stats)",
+            "Fingerprint for %s: dim=%d (3 regions × 120 + global 160)",
             Path(audio_path).name,
             fingerprint.shape[0],
-            n,
         )
         return fingerprint

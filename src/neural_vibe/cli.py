@@ -82,21 +82,32 @@ def index(music_dir: str, data_dir: str, cache_dir: str) -> None:
 @main.command()
 @click.argument("seeds", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("-n", "--num", default=10, show_default=True, help="Number of results.")
+@click.option(
+    "--mode",
+    type=click.Choice(["default", "sound", "emotion", "thought", "vibe"]),
+    default="default",
+    show_default=True,
+    help="Search mode: weight auditory (sound), limbic (emotion), or prefrontal (thought) regions.",
+)
 @click.option("--data-dir", default="data", show_default=True)
 @click.option("--cache-dir", default=".cache/tribev2", show_default=True)
-def query(seeds: tuple[str, ...], num: int, data_dir: str, cache_dir: str) -> None:
+def query(seeds: tuple[str, ...], num: int, mode: str, data_dir: str, cache_dir: str) -> None:
     """Find songs with a similar neural vibe to the seed song(s)."""
     from .encoder import NeuralEncoder
+    from .regions import PRESETS
     from .query import query_similar
 
+    region_weights = PRESETS.get(mode) if mode != "default" else None
     encoder = NeuralEncoder(cache_dir=cache_dir)
 
+    mode_label = f" [dim]({mode} mode)[/dim]" if mode != "default" else ""
     console.print(
-        f"Finding songs similar to [bold]{len(seeds)}[/bold] seed(s)…\n"
+        f"Finding songs similar to [bold]{len(seeds)}[/bold] seed(s)…{mode_label}\n"
     )
 
     matches = query_similar(
-        list(seeds), data_dir=data_dir, n=num, encoder=encoder
+        list(seeds), data_dir=data_dir, n=num, encoder=encoder,
+        region_weights=region_weights,
     )
 
     if not matches:
@@ -250,6 +261,30 @@ def preprocess(
     console.print("[green]Preprocessing complete![/green]")
     console.print(
         f"\nNext step: fine-tune TRIBE v2:\n"
+        f"  neural-vibe finetune {data_dir}"
+    )
+
+
+@main.command("prepare-stimuli")
+@click.argument("data_dir", default="data/nakai2021", type=click.Path(exists=True))
+def prepare_stimuli(data_dir: str) -> None:
+    """Cut GTZAN audio clips to match the Nakai 2021 experiment timings.
+
+    Requires GTZAN dataset at {DATA_DIR}/stimuli/gtzan/genres/.
+    """
+    from pathlib import Path
+
+    from .stimuli import prepare_clips
+
+    console.print(
+        f"Preparing audio clips from GTZAN for [bold]{data_dir}[/bold]…\n"
+    )
+
+    clips_dir = prepare_clips(data_dir=Path(data_dir))
+
+    console.print(f"\n[green]Done![/green] Clips saved to [bold]{clips_dir}[/bold]")
+    console.print(
+        "\nNext step: fine-tune TRIBE v2:\n"
         f"  neural-vibe finetune {data_dir}"
     )
 

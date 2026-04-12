@@ -144,6 +144,7 @@ class Nakai2021Bold(Study):
         )
 
         # --- Music clip events from events.tsv ---
+        clips_dir = self.path / "stimuli" / "clips"
         events_tsv = _get_events_tsv(raw_dir, subject, task, run)
         if events_tsv.exists():
             events_df = pd.read_csv(events_tsv, sep="\t")
@@ -152,18 +153,32 @@ class Nakai2021Bold(Study):
                 onset = float(row["onset"])
                 dur = float(row.get("duration", self.CLIP_DURATION_S))
                 genre = str(row.get("genre", "")).strip("'\"")
+                track = int(row["track"]) if "track" in row else -1
+                clip_start = float(row["start"]) if "start" in row else 0.0
+                clip_end = float(row["end"]) if "end" in row else dur
 
-                audio_event = dict(
+                audio_event: dict[str, tp.Any] = dict(
                     type="Audio",
                     start=onset,
                     duration=dur,
                     stop=onset + dur,
                     genre=genre,
-                    track=int(row["track"]) if "track" in row else -1,
+                    track=track,
                 )
+
+                # Add filepath to pre-cut audio clip if available
+                if clips_dir.exists():
+                    from ..stimuli import get_clip_path
+
+                    clip_path = get_clip_path(
+                        clips_dir, genre, track, clip_start, clip_end
+                    )
+                    if clip_path is not None:
+                        audio_event["filepath"] = str(clip_path)
+
                 all_events.append(audio_event)
 
         result = pd.DataFrame(all_events)
-        result["split"] = "test" if task == _TEST_TASK else "train"
+        result["split"] = "val" if task == _TEST_TASK else "train"
 
         return result
