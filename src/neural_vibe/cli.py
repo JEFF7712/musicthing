@@ -305,9 +305,10 @@ def prepare_stimuli(data_dir: str) -> None:
 
 @main.command()
 @click.argument("data_dir", default="data/nakai2021", type=click.Path(exists=True))
-@click.option("--epochs", default=10, show_default=True)
+@click.option("--epochs", default=20, show_default=True)
 @click.option("--lr", default=1e-5, show_default=True, help="Learning rate.")
 @click.option("--batch-size", default=4, show_default=True)
+@click.option("--patience", default=5, show_default=True, help="Early stopping patience (epochs).")
 @click.option("--output-dir", default="checkpoints/music-finetuned", show_default=True)
 @click.option("--cache-dir", default=".cache/tribev2", show_default=True)
 def finetune(
@@ -315,6 +316,7 @@ def finetune(
     epochs: int,
     lr: float,
     batch_size: int,
+    patience: int,
     output_dir: str,
     cache_dir: str,
 ) -> None:
@@ -328,13 +330,15 @@ def finetune(
         epochs=epochs,
         lr=lr,
         batch_size=batch_size,
+        patience=patience,
     )
 
     console.print("[bold]Fine-tuning TRIBE v2 on music fMRI data[/bold]")
-    console.print(f"  Data:   {data_dir}")
-    console.print(f"  Epochs: {epochs}")
-    console.print(f"  LR:     {lr}")
-    console.print(f"  Output: {output_dir}\n")
+    console.print(f"  Data:     {data_dir}")
+    console.print(f"  Epochs:   {epochs} (early stop patience={patience})")
+    console.print(f"  LR:       {lr} (cosine annealing with warmup)")
+    console.print(f"  Loss:     Pearson correlation")
+    console.print(f"  Output:   {output_dir}\n")
 
     best_ckpt = run_finetune(config)
 

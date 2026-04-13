@@ -42,11 +42,36 @@ class FinetuneConfig:
     freeze_projectors: bool = False
     freeze_transformer: bool = False
 
+    # Early stopping
+    patience: int = 5
+
+    # LR schedule
+    warmup_epochs: int = 1
+
     # Hardware
     device: str = "auto"
 
     # Segment duration must match model's n_output_timesteps (100)
     segment_duration_trs: int = 100
+
+
+def _pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Negative Pearson correlation loss across cortical vertices.
+
+    Args:
+        pred, target: (N, D) tensors where D is number of vertices.
+
+    Returns:
+        Scalar: 1 - mean_correlation. Lower = better pattern match.
+    """
+    pred_c = pred - pred.mean(dim=1, keepdim=True)
+    tgt_c = target - target.mean(dim=1, keepdim=True)
+    num = (pred_c * tgt_c).sum(dim=1)
+    den = torch.sqrt(
+        (pred_c ** 2).sum(dim=1) * (tgt_c ** 2).sum(dim=1)
+    )
+    corr = num / (den + 1e-8)
+    return 1.0 - corr.mean()
 
 
 def finetune(config: FinetuneConfig | None = None) -> Path:
@@ -177,14 +202,36 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
         [p for p in brain_model.parameters() if p.requires_grad],
         lr=config.lr,
     )
-    criterion = torch.nn.MSELoss()
+
+    # Cosine annealing with linear warmup
+    warmup_epochs = min(config.warmup_epochs, config.epochs)
+    cosine_epochs = config.epochs - warmup_epochs
+
+    warmup_scheduler = (
+        torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=warmup_epochs
+        )
+        if warmup_epochs > 0
+        else None
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(cosine_epochs, 1)
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[s for s in [warmup_scheduler, cosine_scheduler] if s is not None],
+        milestones=[warmup_epochs] if warmup_epochs > 0 else [],
+    )
 
     best_val_loss = float("inf")
     best_ckpt = output_dir / "best.pt"
+    epochs_without_improvement = 0
 
     log.info(
-        "Starting fine-tuning: epochs=%d, lr=%s, batch_size=%d, device=%s",
+        "Starting fine-tuning: epochs=%d, lr=%s, batch_size=%d, device=%s, "
+        "loss=pearson, warmup=%d, patience=%d",
         config.epochs, config.lr, config.batch_size, device,
+        warmup_epochs, config.patience,
     )
 
     for epoch in range(config.epochs):
@@ -216,7 +263,7 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
             y_true_flat = y_true_flat[valid]
             y_pred_flat = y_pred_flat[valid]
 
-            loss = criterion(y_pred_flat, y_true_flat)
+            loss = _pearson_loss(y_pred_flat, y_true_flat)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -251,27 +298,48 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
                     y_true_flat = y_true_flat[valid]
                     y_pred_flat = y_pred_flat[valid]
 
-                    loss = criterion(y_pred_flat, y_true_flat)
+                    loss = _pearson_loss(y_pred_flat, y_true_flat)
                     val_loss += loss.item()
                     n_val_batches += 1
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val = val_loss / max(n_val_batches, 1)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Correlation = 1 - loss (higher is better)
+        train_corr = 1.0 - avg_train
+        val_corr = 1.0 - avg_val if n_val_batches > 0 else float("nan")
 
         log.info(
-            "Epoch %d/%d — train_loss: %.4f, val_loss: %.4f",
-            epoch + 1, config.epochs, avg_train, avg_val,
+            "Epoch %d/%d — train_corr: %.4f, val_corr: %.4f, lr: %.2e",
+            epoch + 1, config.epochs, train_corr, val_corr, current_lr,
         )
 
+        scheduler.step()
+
+        # --- Checkpointing & early stopping ---
         if n_val_batches > 0 and avg_val < best_val_loss:
             best_val_loss = avg_val
+            epochs_without_improvement = 0
             torch.save(brain_model.state_dict(), best_ckpt)
-            log.info("  → New best model saved (val_loss=%.4f)", avg_val)
-        elif n_val_batches == 0:
+            log.info("  → New best model saved (val_corr=%.4f)", val_corr)
+        elif n_val_batches > 0:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= config.patience:
+                log.info(
+                    "Early stopping: no improvement for %d epochs.",
+                    config.patience,
+                )
+                break
+        else:
             # No validation data — save every epoch
             torch.save(brain_model.state_dict(), best_ckpt)
 
-    log.info("Fine-tuning complete. Best checkpoint: %s", best_ckpt)
+    best_corr = 1.0 - best_val_loss if best_val_loss < float("inf") else float("nan")
+    log.info(
+        "Fine-tuning complete. Best val_corr=%.4f, checkpoint: %s",
+        best_corr, best_ckpt,
+    )
     return best_ckpt
 
 
