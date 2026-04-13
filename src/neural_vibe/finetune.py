@@ -96,6 +96,8 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
             "data.shuffle_train": True,
             "data.shuffle_val": False,
             "average_subjects": True,
+            # Use nilearn's bundled fsaverage mesh instead of FreeSurfer
+            "data.neuro.projection.extract_fsaverage_from_mni": False,
         },
     )
 
