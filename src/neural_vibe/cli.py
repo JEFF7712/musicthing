@@ -43,7 +43,13 @@ def main(verbose: bool) -> None:
     show_default=True,
     help="Model cache directory.",
 )
-def index(music_dir: str, data_dir: str, cache_dir: str) -> None:
+@click.option(
+    "--checkpoint",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to fine-tuned model checkpoint (.pt).",
+)
+def index(music_dir: str, data_dir: str, cache_dir: str, checkpoint: str | None) -> None:
     """Index a music library for neural similarity search."""
     from .encoder import NeuralEncoder
     from .indexer import build_index, find_audio_files
@@ -54,8 +60,10 @@ def index(music_dir: str, data_dir: str, cache_dir: str) -> None:
         sys.exit(1)
 
     console.print(f"Found [bold]{len(files)}[/bold] audio files in {music_dir}")
+    if checkpoint:
+        console.print(f"Using fine-tuned model: [bold]{checkpoint}[/bold]")
 
-    encoder = NeuralEncoder(cache_dir=cache_dir)
+    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint)
 
     with Progress(
         SpinnerColumn(),
@@ -91,14 +99,20 @@ def index(music_dir: str, data_dir: str, cache_dir: str) -> None:
 )
 @click.option("--data-dir", default="data", show_default=True)
 @click.option("--cache-dir", default=".cache/tribev2", show_default=True)
-def query(seeds: tuple[str, ...], num: int, mode: str, data_dir: str, cache_dir: str) -> None:
+@click.option(
+    "--checkpoint",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to fine-tuned model checkpoint (.pt).",
+)
+def query(seeds: tuple[str, ...], num: int, mode: str, data_dir: str, cache_dir: str, checkpoint: str | None) -> None:
     """Find songs with a similar neural vibe to the seed song(s)."""
     from .encoder import NeuralEncoder
     from .regions import PRESETS
     from .query import query_similar
 
     region_weights = PRESETS.get(mode) if mode != "default" else None
-    encoder = NeuralEncoder(cache_dir=cache_dir)
+    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint)
 
     mode_label = f" [dim]({mode} mode)[/dim]" if mode != "default" else ""
     console.print(

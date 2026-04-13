@@ -113,12 +113,14 @@ class NeuralEncoder:
         cache_dir: str = ".cache/tribev2",
         device: str | None = None,
         region_weights: dict[str, float] | None = None,
+        checkpoint: str | None = None,
     ):
         self._cache_dir = cache_dir
         self._device = device or self._pick_device()
         self._model = None
         self._region_weights = region_weights
         self._weight_vector = None
+        self._checkpoint = checkpoint
 
     @staticmethod
     def _pick_device() -> str:
@@ -151,6 +153,19 @@ class NeuralEncoder:
             cache_folder=self._cache_dir,
             config_update=config_update,
         )
+
+        # Load fine-tuned weights if a checkpoint was provided
+        if self._checkpoint:
+            ckpt_path = Path(self._checkpoint)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            log.info("Loading fine-tuned weights from %s", ckpt_path)
+            state_dict = torch.load(
+                ckpt_path, map_location=self._device, weights_only=True
+            )
+            self._model._model.load_state_dict(state_dict, strict=True)
+            log.info("Fine-tuned weights loaded.")
+
         log.info("TRIBE v2 model loaded.")
 
     def predict_brain_response(self, audio_path: str | Path) -> np.ndarray:
