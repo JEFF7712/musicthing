@@ -309,6 +309,13 @@ def prepare_stimuli(data_dir: str) -> None:
 @click.option("--lr", default=1e-5, show_default=True, help="Learning rate.")
 @click.option("--batch-size", default=4, show_default=True)
 @click.option("--patience", default=5, show_default=True, help="Early stopping patience (epochs).")
+@click.option(
+    "--freeze",
+    type=click.Choice(["head-only", "default", "none"]),
+    default="default",
+    show_default=True,
+    help="Freezing strategy: head-only (freeze encoders+transformer), default (freeze encoders), none.",
+)
 @click.option("--output-dir", default="checkpoints/music-finetuned", show_default=True)
 @click.option("--cache-dir", default=".cache/tribev2", show_default=True)
 def finetune(
@@ -317,11 +324,15 @@ def finetune(
     lr: float,
     batch_size: int,
     patience: int,
+    freeze: str,
     output_dir: str,
     cache_dir: str,
 ) -> None:
     """Fine-tune TRIBE v2 on the Nakai 2021 music fMRI data."""
     from .finetune import FinetuneConfig, finetune as run_finetune
+
+    freeze_transformer = freeze == "head-only"
+    freeze_encoders = freeze != "none"
 
     config = FinetuneConfig(
         data_dir=data_dir,
@@ -331,6 +342,8 @@ def finetune(
         lr=lr,
         batch_size=batch_size,
         patience=patience,
+        freeze_encoders=freeze_encoders,
+        freeze_transformer=freeze_transformer,
     )
 
     console.print("[bold]Fine-tuning TRIBE v2 on music fMRI data[/bold]")
@@ -338,6 +351,7 @@ def finetune(
     console.print(f"  Epochs:   {epochs} (early stop patience={patience})")
     console.print(f"  LR:       {lr} (cosine annealing with warmup)")
     console.print(f"  Loss:     Pearson correlation")
+    console.print(f"  Freeze:   {freeze}")
     console.print(f"  Output:   {output_dir}\n")
 
     best_ckpt = run_finetune(config)
