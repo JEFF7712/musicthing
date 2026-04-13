@@ -45,8 +45,8 @@ class FinetuneConfig:
     # Hardware
     device: str = "auto"
 
-    # Segment parameters (matching TRIBE v2 defaults)
-    segment_duration_trs: int = 20  # ~30s at TR=1.5s
+    # Segment duration must match model's n_output_timesteps (100)
+    segment_duration_trs: int = 100
 
 
 def finetune(config: FinetuneConfig | None = None) -> Path:
@@ -198,6 +198,12 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
             y_true = batch.data["fmri"]  # (B, D, T)
             y_pred = brain_model(batch)  # (B, D, T)
 
+            # Match time dimensions if they differ
+            if y_pred.shape[2] != y_true.shape[2]:
+                y_pred = torch.nn.functional.adaptive_avg_pool1d(
+                    y_pred, y_true.shape[2]
+                )
+
             # Flatten time: (B*T, D)
             B, D, T = y_true.shape
             y_true_flat = y_true.permute(0, 2, 1).reshape(-1, D)
@@ -229,6 +235,11 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
                     batch = batch.to(device)
                     y_true = batch.data["fmri"]
                     y_pred = brain_model(batch)
+
+                    if y_pred.shape[2] != y_true.shape[2]:
+                        y_pred = torch.nn.functional.adaptive_avg_pool1d(
+                            y_pred, y_true.shape[2]
+                        )
 
                     B, D, T = y_true.shape
                     y_true_flat = y_true.permute(0, 2, 1).reshape(-1, D)
