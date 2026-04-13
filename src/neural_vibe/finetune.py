@@ -24,11 +24,19 @@ import torch
 log = logging.getLogger(__name__)
 
 
+# Known dataset types and their Study adapter classes
+DATASET_TYPES = {
+    "nakai2021": "neural_vibe.studies.nakai2021:Nakai2021Bold",
+    "studyforrest": "neural_vibe.studies.studyforrest:StudyForrestMusic",
+}
+
+
 @dataclass
 class FinetuneConfig:
     """Configuration for fine-tuning TRIBE v2 on music fMRI data."""
 
     data_dir: str = "data/nakai2021"
+    extra_data_dirs: list[str] | None = None  # Additional datasets
     cache_dir: str = ".cache/tribev2"
     output_dir: str = "checkpoints/music-finetuned"
 
@@ -53,6 +61,39 @@ class FinetuneConfig:
 
     # Segment duration must match model's n_output_timesteps (100)
     segment_duration_trs: int = 100
+
+
+def _load_study(data_dir: Path):
+    """Auto-detect and load the right Study adapter for a data directory.
+
+    Detection heuristic:
+    - If a `study_type.txt` file exists, use its contents
+    - If raw/ contains ses-auditoryperception dirs → StudyForrest
+    - If raw/ contains task-Training events → Nakai2021
+    """
+    # Explicit type file
+    type_file = data_dir / "study_type.txt"
+    if type_file.exists():
+        study_type = type_file.read_text().strip()
+    else:
+        # Auto-detect from directory structure
+        raw_dir = data_dir / "raw"
+        if any(raw_dir.glob("*/ses-auditoryperception")):
+            study_type = "studyforrest"
+        else:
+            study_type = "nakai2021"
+
+    if study_type not in DATASET_TYPES:
+        raise ValueError(
+            f"Unknown study type '{study_type}'. "
+            f"Known types: {', '.join(DATASET_TYPES)}"
+        )
+
+    module_path, class_name = DATASET_TYPES[study_type].rsplit(":", 1)
+    import importlib
+    module = importlib.import_module(module_path)
+    cls = getattr(module, class_name)
+    return cls(path=data_dir)
 
 
 def _pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -85,21 +126,6 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Validate stimuli ---
-    data_dir = Path(config.data_dir)
-    clips_dir = data_dir / "stimuli" / "clips"
-    if not clips_dir.exists() or not any(clips_dir.glob("*.wav")):
-        raise FileNotFoundError(
-            f"Audio stimuli not found at {clips_dir}.\n"
-            "The fine-tuning pipeline needs the original music that subjects\n"
-            "listened to during the fMRI scans (GTZAN dataset).\n\n"
-            "Steps to set up:\n"
-            "  1. Download GTZAN dataset (genres.tar.gz)\n"
-            f"  2. Extract to: {data_dir}/stimuli/gtzan/genres/\n"
-            f"  3. Run: neural-vibe prepare-stimuli {data_dir}\n"
-            f"  4. Run: neural-vibe finetune {data_dir}"
-        )
-
     device = config.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -128,19 +154,36 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
 
     brain_model = tribe._model
 
-    # --- Load study data ---
-    log.info("Loading Nakai 2021 study from %s…", config.data_dir)
-    from .studies.nakai2021 import Nakai2021Bold
+    # --- Load study data (support multiple datasets) ---
+    all_data_dirs = [config.data_dir]
+    if config.extra_data_dirs:
+        all_data_dirs.extend(config.extra_data_dirs)
 
-    study = Nakai2021Bold(path=data_dir)
-    events = study.run()
+    all_events = []
+    for data_dir_str in all_data_dirs:
+        data_dir = Path(data_dir_str)
+        study = _load_study(data_dir)
+        log.info("Loading %s from %s…", type(study).__name__, data_dir)
+        events = study.run()
+        all_events.append(events)
+        log.info(
+            "  %s: %d events (%d train, %d val, %d audio, %d fmri)",
+            data_dir.name,
+            len(events),
+            (events.split == "train").sum(),
+            (events.split == "val").sum(),
+            (events.type == "Audio").sum(),
+            (events.type == "Fmri").sum(),
+        )
+
+    events = pd.concat(all_events, ignore_index=True)
 
     n_train = (events.split == "train").sum()
     n_val = (events.split == "val").sum()
     n_audio = (events.type == "Audio").sum()
     n_fmri = (events.type == "Fmri").sum()
     log.info(
-        "Events: %d total (%d train, %d val, %d audio, %d fmri)",
+        "Combined events: %d total (%d train, %d val, %d audio, %d fmri)",
         len(events), n_train, n_val, n_audio, n_fmri,
     )
 
@@ -149,7 +192,7 @@ def finetune(config: FinetuneConfig | None = None) -> Path:
     if "filepath" not in audio_events.columns or audio_events.filepath.isna().all():
         raise RuntimeError(
             "Audio events have no filepath — stimuli clips not linked.\n"
-            f"Run: neural-vibe prepare-stimuli {config.data_dir}"
+            "Ensure audio stimuli are set up for each dataset."
         )
 
     has_filepath = audio_events.filepath.notna().sum()

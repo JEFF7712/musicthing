@@ -309,6 +309,7 @@ def prepare_stimuli(data_dir: str) -> None:
 
 @main.command()
 @click.argument("data_dir", default="data/nakai2021", type=click.Path(exists=True))
+@click.option("--extra-data", multiple=True, type=click.Path(exists=True), help="Additional dataset directories to include.")
 @click.option("--epochs", default=20, show_default=True)
 @click.option("--lr", default=1e-5, show_default=True, help="Learning rate.")
 @click.option("--batch-size", default=4, show_default=True)
@@ -324,6 +325,7 @@ def prepare_stimuli(data_dir: str) -> None:
 @click.option("--cache-dir", default=".cache/tribev2", show_default=True)
 def finetune(
     data_dir: str,
+    extra_data: tuple[str, ...],
     epochs: int,
     lr: float,
     batch_size: int,
@@ -332,7 +334,7 @@ def finetune(
     output_dir: str,
     cache_dir: str,
 ) -> None:
-    """Fine-tune TRIBE v2 on the Nakai 2021 music fMRI data."""
+    """Fine-tune TRIBE v2 on music fMRI data."""
     from .finetune import FinetuneConfig, finetune as run_finetune
 
     freeze_transformer = freeze == "head-only"
@@ -340,6 +342,7 @@ def finetune(
 
     config = FinetuneConfig(
         data_dir=data_dir,
+        extra_data_dirs=list(extra_data) if extra_data else None,
         cache_dir=cache_dir,
         output_dir=output_dir,
         epochs=epochs,
@@ -350,8 +353,9 @@ def finetune(
         freeze_transformer=freeze_transformer,
     )
 
+    all_dirs = [data_dir] + list(extra_data)
     console.print("[bold]Fine-tuning TRIBE v2 on music fMRI data[/bold]")
-    console.print(f"  Data:     {data_dir}")
+    console.print(f"  Data:     {', '.join(all_dirs)}")
     console.print(f"  Epochs:   {epochs} (early stop patience={patience})")
     console.print(f"  LR:       {lr} (cosine annealing with warmup)")
     console.print(f"  Loss:     Pearson correlation")
