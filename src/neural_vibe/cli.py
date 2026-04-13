@@ -49,7 +49,8 @@ def main(verbose: bool) -> None:
     type=click.Path(exists=True),
     help="Path to fine-tuned model checkpoint (.pt).",
 )
-def index(music_dir: str, data_dir: str, cache_dir: str, checkpoint: str | None) -> None:
+@click.option("--no-clap", is_flag=True, help="Disable CLAP music embedding (brain-only fingerprints).")
+def index(music_dir: str, data_dir: str, cache_dir: str, checkpoint: str | None, no_clap: bool) -> None:
     """Index a music library for neural similarity search."""
     from .encoder import NeuralEncoder
     from .indexer import build_index, find_audio_files
@@ -62,8 +63,10 @@ def index(music_dir: str, data_dir: str, cache_dir: str, checkpoint: str | None)
     console.print(f"Found [bold]{len(files)}[/bold] audio files in {music_dir}")
     if checkpoint:
         console.print(f"Using fine-tuned model: [bold]{checkpoint}[/bold]")
+    if not no_clap:
+        console.print("Using hybrid fingerprints: [bold]brain + CLAP music[/bold]")
 
-    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint)
+    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint, use_clap=not no_clap)
 
     with Progress(
         SpinnerColumn(),
@@ -105,14 +108,15 @@ def index(music_dir: str, data_dir: str, cache_dir: str, checkpoint: str | None)
     type=click.Path(exists=True),
     help="Path to fine-tuned model checkpoint (.pt).",
 )
-def query(seeds: tuple[str, ...], num: int, mode: str, data_dir: str, cache_dir: str, checkpoint: str | None) -> None:
+@click.option("--no-clap", is_flag=True, help="Disable CLAP music embedding (brain-only fingerprints).")
+def query(seeds: tuple[str, ...], num: int, mode: str, data_dir: str, cache_dir: str, checkpoint: str | None, no_clap: bool) -> None:
     """Find songs with a similar neural vibe to the seed song(s)."""
     from .encoder import NeuralEncoder
     from .regions import PRESETS
     from .query import query_similar
 
     region_weights = PRESETS.get(mode) if mode != "default" else None
-    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint)
+    encoder = NeuralEncoder(cache_dir=cache_dir, checkpoint=checkpoint, use_clap=not no_clap)
 
     mode_label = f" [dim]({mode} mode)[/dim]" if mode != "default" else ""
     console.print(

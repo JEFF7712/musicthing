@@ -14,23 +14,34 @@ from .indexer import load_index
 
 log = logging.getLogger(__name__)
 
-# Fingerprint layout: [auditory(120) | limbic(120) | prefrontal(120) | global(160)]
-REGION_DIMS = {"auditory": 120, "limbic": 120, "prefrontal": 120, "global": 160}
+# Fingerprint layout: [auditory(120) | limbic(120) | prefrontal(120) | global(160) | clap(512)?]
+BRAIN_DIMS = {"auditory": 120, "limbic": 120, "prefrontal": 120, "global": 160}
+BRAIN_TOTAL = sum(BRAIN_DIMS.values())  # 520
 
 
-def _build_weight_mask(weights: dict[str, float] | None) -> np.ndarray | None:
+def _build_weight_mask(
+    weights: dict[str, float] | None, fingerprint_dim: int
+) -> np.ndarray | None:
     """Build a per-dimension weight mask from region group weights.
 
     Scales the fingerprint segments so that cosine similarity
-    emphasizes the weighted regions more.
+    emphasizes the weighted regions more. Automatically handles
+    both brain-only (520-dim) and hybrid (1032-dim) fingerprints.
     """
     if weights is None:
         return None
 
     parts = []
-    for name, dim in REGION_DIMS.items():
+    for name, dim in BRAIN_DIMS.items():
         w = weights.get(name, 1.0)
         parts.append(np.full(dim, w, dtype=np.float32))
+
+    # Append CLAP weight if fingerprint includes it
+    if fingerprint_dim > BRAIN_TOTAL:
+        clap_dim = fingerprint_dim - BRAIN_TOTAL
+        w = weights.get("clap", 1.0)
+        parts.append(np.full(clap_dim, w, dtype=np.float32))
+
     return np.concatenate(parts)
 
 
@@ -74,7 +85,7 @@ def query_similar(
     if encoder is None:
         encoder = NeuralEncoder()
 
-    weight_mask = _build_weight_mask(region_weights)
+    weight_mask = _build_weight_mask(region_weights, index.d)
 
     # Encode seed songs and average their fingerprints
     fingerprints = []

@@ -22,6 +22,12 @@ log = logging.getLogger(__name__)
 # but needs ~6GB VRAM; "small" needs ~500MB and is much faster on limited GPUs.
 WHISPER_MODEL = os.environ.get("NEURAL_VIBE_WHISPER_MODEL", "small")
 
+# Text LLM for lyric/semantic features. Llama 3.2 3B is the TRIBE v2 default
+# but needs ~6 hours per song on CPU. GPT-2 (124M) is ~100x faster on CPU
+# while still capturing lyrical/semantic content for brain prediction.
+# Set NEURAL_VIBE_TEXT_MODEL to override (e.g. "meta-llama/Llama-3.2-3B" with GPU).
+TEXT_MODEL = os.environ.get("NEURAL_VIBE_TEXT_MODEL", "gpt2")
+
 
 def _patch_whisperx_model():
     """Monkey-patch TRIBE v2's WhisperX invocation to use a smaller/faster model
@@ -100,6 +106,25 @@ def _patch_whisperx_model():
     et.ExtractWordsFromAudio._get_transcript_from_audio = _patched_transcribe
 
 
+def _patch_text_model_fp16():
+    """Monkey-patch TRIBE v2's text model loading to use fp16 on GPU.
+
+    Only applies to CUDA — fp16 on CPU is actually *slower* because most
+    CPUs lack native fp16 compute and PyTorch upcasts every operation.
+    """
+    from neuralset.extractors.text import HuggingFaceText
+
+    _original_load = HuggingFaceText._load_model
+
+    def _load_model_fp16(self, **kwargs):
+        if self.device == "cuda" and "torch_dtype" not in kwargs:
+            kwargs["torch_dtype"] = torch.float16
+            log.info("Loading text model %s in fp16 to save VRAM", self.model_name)
+        return _original_load(self, **kwargs)
+
+    HuggingFaceText._load_model = _load_model_fp16
+
+
 class NeuralEncoder:
     """Encodes audio files into neural fingerprints using TRIBE v2.
 
@@ -108,12 +133,16 @@ class NeuralEncoder:
     activations over time.
     """
 
+    # CLAP embedding dimension (laion/larger_clap_music projection output)
+    CLAP_DIM = 512
+
     def __init__(
         self,
         cache_dir: str = ".cache/tribev2",
         device: str | None = None,
         region_weights: dict[str, float] | None = None,
         checkpoint: str | None = None,
+        use_clap: bool = True,
     ):
         self._cache_dir = cache_dir
         self._device = device or self._pick_device()
@@ -121,6 +150,9 @@ class NeuralEncoder:
         self._region_weights = region_weights
         self._weight_vector = None
         self._checkpoint = checkpoint
+        self._use_clap = use_clap
+        self._clap_model = None
+        self._clap_processor = None
 
     @staticmethod
     def _pick_device() -> str:
@@ -134,19 +166,20 @@ class NeuralEncoder:
         if self._model is not None:
             return
 
-        # Patch WhisperX before any TRIBE v2 imports trigger it
+        # Patch WhisperX and text model loading before any TRIBE v2 imports
         _patch_whisperx_model()
+        _patch_text_model_fp16()
 
         from tribev2 import TribeModel
 
-        log.info("Loading TRIBE v2 model (device=%s)…", self._device)
-        # Override device for all extractors — the shipped config hardcodes "cuda"
-        # Also disable text features: Llama 3.2 3B is too slow on CPU (~hours
-        # per song). Audio features (Wav2VecBert) capture the sound itself,
-        # which is what matters for music "vibe" matching.
+        log.info("Loading TRIBE v2 model (device=%s, text_model=%s)…", self._device, TEXT_MODEL)
         config_update = {
             "data.audio_feature.device": self._device,
-            "data.features_to_use": ["audio"],
+            "data.text_feature.device": "cpu",
+            "data.text_feature.model_name": TEXT_MODEL,
+            "data.text_feature.contextualized": False,
+            "data.text_feature.batch_size": 32,
+            "data.features_to_use": ["audio", "text"],
         }
         self._model = TribeModel.from_pretrained(
             "facebook/tribev2",
@@ -154,7 +187,8 @@ class NeuralEncoder:
             config_update=config_update,
         )
 
-        # Load fine-tuned weights if a checkpoint was provided
+        # Load fine-tuned weights if a checkpoint was provided (before
+        # projector adaptation, since the checkpoint has original dimensions).
         if self._checkpoint:
             ckpt_path = Path(self._checkpoint)
             if not ckpt_path.exists():
@@ -166,7 +200,126 @@ class NeuralEncoder:
             self._model._model.load_state_dict(state_dict, strict=True)
             log.info("Fine-tuned weights loaded.")
 
+        # Adapt the text projector if the text model's hidden size differs
+        # from Llama 3.2 3B (which the pretrained projector was trained for).
+        # Must happen AFTER checkpoint loading since checkpoints have original dims.
+        self._adapt_text_projector()
+
         log.info("TRIBE v2 model loaded.")
+
+    def _adapt_text_projector(self) -> None:
+        """Resize the text projector if the text model's hidden size doesn't
+        match the pretrained Llama 3.2 3B dimensions.
+
+        The pretrained text projector is Linear(6144 → 384). If using a
+        smaller model (e.g. GPT-2 with 1536-dim output), we derive new
+        weights by folding the original weight matrix.
+        """
+        model = self._model._model
+        if "text" not in model.projectors:
+            return
+        proj = model.projectors["text"]
+
+        expected_in = proj.in_features  # 6144 for pretrained
+        # Probe the actual text feature dimension by checking the model's hidden size
+        text_cfg = self._model.data.text_feature
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(text_cfg.model_name)
+        hidden = hf_config.hidden_size
+
+        # Compute actual feature dim: hidden_size × number of layer groups
+        layers = text_cfg.layers if isinstance(text_cfg.layers, list) else [text_cfg.layers]
+        if text_cfg.layer_aggregation == "group_mean":
+            n_groups = max(len(layers) - 1, 1)
+        elif text_cfg.layer_aggregation in ("mean", "sum"):
+            n_groups = 1
+        else:
+            n_groups = len(layers)
+        actual_in = hidden * n_groups
+
+        if actual_in == expected_in:
+            return
+
+        log.info(
+            "Adapting text projector: %d → %d (was %d)",
+            actual_in, proj.out_features, expected_in,
+        )
+        with torch.no_grad():
+            old_w = proj.weight.data  # (out, expected_in)
+            old_b = proj.bias.data if proj.bias is not None else None
+            ratio = expected_in // actual_in
+            if expected_in % actual_in == 0 and ratio > 1:
+                # Fold: reshape (out, ratio*actual_in) → (out, ratio, actual_in), average
+                new_w = old_w.reshape(proj.out_features, ratio, actual_in).mean(dim=1)
+            else:
+                # Truncate or interpolate
+                new_w = old_w[:, :actual_in]
+
+            new_proj = torch.nn.Linear(actual_in, proj.out_features, bias=old_b is not None)
+            new_proj.weight.data = new_w
+            if old_b is not None:
+                new_proj.bias.data = old_b
+            new_proj.to(proj.weight.device)
+
+        model.projectors["text"] = new_proj
+
+    def _load_clap(self) -> None:
+        """Lazy-load the CLAP music audio encoder."""
+        if self._clap_model is not None:
+            return
+        from transformers import ClapModel, AutoFeatureExtractor
+
+        log.info("Loading CLAP music encoder (laion/larger_clap_music)…")
+        clap = ClapModel.from_pretrained(
+            "laion/larger_clap_music", cache_dir=self._cache_dir
+        )
+        self._clap_model = clap.audio_model.eval()
+        self._clap_projection = clap.audio_projection.eval()
+        self._clap_processor = AutoFeatureExtractor.from_pretrained(
+            "laion/larger_clap_music", cache_dir=self._cache_dir
+        )
+        log.info("CLAP loaded.")
+
+    def _encode_clap(self, audio_path: str | Path) -> np.ndarray:
+        """Get CLAP audio embedding for a song.
+
+        Splits long audio into 10-second chunks and averages embeddings
+        to represent the full song.
+
+        Returns:
+            1-D float32 array of shape (512,).
+        """
+        self._load_clap()
+        import torchaudio
+
+        waveform, sr = torchaudio.load(str(audio_path))
+        target_sr = 48000
+        if sr != target_sr:
+            waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+        audio = waveform.mean(dim=0).numpy()  # mono
+
+        # Split into 10s chunks for full-song coverage
+        chunk_samples = target_sr * 10
+        chunks = []
+        for start in range(0, len(audio), chunk_samples):
+            chunk = audio[start : start + chunk_samples]
+            if len(chunk) < target_sr:  # skip < 1 second
+                continue
+            chunks.append(chunk)
+        if not chunks:
+            chunks = [audio]
+
+        embeddings = []
+        for chunk in chunks:
+            inputs = self._clap_processor(
+                audios=chunk, sampling_rate=target_sr, return_tensors="pt"
+            )
+            with torch.no_grad():
+                audio_features = self._clap_model(**inputs).pooler_output
+                audio_embed = self._clap_projection(audio_features)
+            embeddings.append(audio_embed.squeeze().cpu().numpy())
+
+        return np.mean(embeddings, axis=0).astype(np.float32)
 
     def predict_brain_response(self, audio_path: str | Path) -> np.ndarray:
         """Run TRIBE v2 on an audio file.
@@ -216,14 +369,14 @@ class NeuralEncoder:
         """Encode a song into a neural fingerprint vector.
 
         Computes separate PCA fingerprints for each brain region group
-        (auditory, limbic, prefrontal) plus the full cortex. This allows
-        region-weighted similarity at query time without re-indexing.
+        (auditory, limbic, prefrontal) plus the full cortex. Optionally
+        appends a CLAP music embedding for hybrid similarity.
 
         The fingerprint layout is:
-          [auditory_stats | limbic_stats | prefrontal_stats | global_stats]
+          [auditory(120) | limbic(120) | prefrontal(120) | global(160) | clap(512)?]
 
         Returns:
-            1-D float32 array.
+            1-D float32 array (520 dims without CLAP, 1032 with).
         """
         from .regions import REGION_GROUPS, load_vertex_labels
 
@@ -241,12 +394,25 @@ class NeuralEncoder:
 
         # Global PCA (20 components × 8 stats = 160 dims)
         global_part = self._pca_stats(preds, n_components=20)
+        brain_fp = np.concatenate(region_parts + [global_part]).astype(np.float32)
 
-        fingerprint = np.concatenate(region_parts + [global_part]).astype(np.float32)
+        if self._use_clap:
+            clap_emb = self._encode_clap(audio_path)
+            # Normalize each part independently so they contribute equally
+            brain_norm = brain_fp / (np.linalg.norm(brain_fp) + 1e-8)
+            clap_norm = clap_emb / (np.linalg.norm(clap_emb) + 1e-8)
+            fingerprint = np.concatenate([brain_norm, clap_norm]).astype(np.float32)
+            log.info(
+                "Fingerprint for %s: dim=%d (brain 520 + CLAP 512)",
+                Path(audio_path).name,
+                fingerprint.shape[0],
+            )
+        else:
+            fingerprint = brain_fp
+            log.info(
+                "Fingerprint for %s: dim=%d (brain only)",
+                Path(audio_path).name,
+                fingerprint.shape[0],
+            )
 
-        log.info(
-            "Fingerprint for %s: dim=%d (3 regions × 120 + global 160)",
-            Path(audio_path).name,
-            fingerprint.shape[0],
-        )
         return fingerprint

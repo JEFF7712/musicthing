@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=2.0",
     "mutagen>=1.47",
     "scipy>=1.12",
+    "transformers>=4.36",
+    "torchaudio",
 ]
 
 [project.optional-dependencies]
